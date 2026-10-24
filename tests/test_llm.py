@@ -256,3 +256,74 @@ def test_image_selection_prefers_text_poor_pages():
                          images={n: b"x" for n in range(1, 5)})
     assert select_images(deck, 2) == [2, 3]
     assert select_images(deck, 10) == [1, 2, 3, 4]
+
+
+def sequenced_client(outcomes, captured):
+    """Fake client: each stream() call takes the next outcome (exception or message)."""
+    queue = list(outcomes)
+
+    def stream(**kwargs):
+        captured.append(kwargs)
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return FakeStream(item)
+
+    return SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=stream)))
+
+
+def bad_request(message):
+    return anthropic.BadRequestError(message, response=httpx.Response(400, request=REQ), body=None)
+
+
+def ok_message(demo_json):
+    return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=json.dumps(demo_json))])
+
+
+def test_schema_rejection_falls_back_with_schema_in_prompt(settings, demo_json):
+    from pitch90.llm import SCHEMA_INSTRUCTION
+
+    captured: list = []
+    client = sequenced_client([bad_request("output_config.format.schema: too complex"), ok_message(demo_json)],
+                              captured)
+    result, _ = AnthropicAnalyzer(settings, client=client).analyze(tiny_deck())
+    assert result.company_name
+    first, second = captured
+    assert "format" in first["output_config"]
+    assert "format" not in second["output_config"]
+    instruction = second["messages"][0]["content"][-1]["text"]
+    assert instruction.startswith(SCHEMA_INSTRUCTION.split("{")[0])
+    assert '"elements"' in instruction and '"customer_problem"' in instruction
+
+
+@pytest.mark.parametrize("message", [
+    "messages.0.content.1.image.source.base64: invalid image format",
+    "output_config.effort: invalid value",
+])
+def test_unrelated_400_does_not_drop_structured_output(settings, demo_json, message):
+    captured: list = []
+    client = sequenced_client([bad_request(message), ok_message(demo_json)], captured)
+    with pytest.raises(LLMError, match="rejected the request"):
+        AnthropicAnalyzer(settings, client=client).analyze(tiny_deck())
+    assert len(captured) == 1  # no silent retry without the schema
+
+
+def test_system_prompt_names_exact_keys():
+    from pitch90.llm import SYSTEM_PROMPT
+
+    for key in ("elements", "customer_problem", "obstacles_capabilities", "onepager", "pitch_script"):
+        assert key in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("elements", [
+    {"Customer and problem": {"score": "4/5", "rationale": "r"}, "Why now": {"score": 3},
+     "Desired outcome": "3", "Obstacles & capabilities": {"score": 4.0}, "Evidence": {"score": "3"}},
+    [{"name": "1. Customer & Problem", "score": 4}, {"title": "Why Now", "score": "3"},
+     {"element": "desired-outcome", "score": 3}, {"element": "Obstacles and Capabilities", "score": 4},
+     {"element": "EVIDENCE", "score": 3.0}],
+])
+def test_common_element_shape_variations_accepted(demo_json, elements):
+    demo_json["elements"] = elements
+    result = parse_response(json.dumps({"analysis": demo_json}))
+    assert [e.score for e in result.elements] == [4, 3, 3, 4, 3]
+    assert not any("not assessed" in n for n in result.salvage_notes)

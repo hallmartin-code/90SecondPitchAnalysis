@@ -96,7 +96,25 @@ draft an investor-facing one-page summary from the deck's own content.
   one; `contact` only with details the deck provides. Each section's `citations` lists
   the supporting slide/page numbers.
 </rules>
+
+<output_format>
+Return one JSON object (no prose, no code fences) with exactly these top-level keys:
+company_name, facts, elements, obstacle_capability_pairs, strongest_points, priority_fixes,
+inconsistencies, information_gaps, extraction_limitations, visual_observations, pitch_script,
+onepager.
+`elements` is a list of five objects, one per narrative element, each with keys
+element, score, rationale, source_pages, missing_or_weak, improvement. `element` must be
+one of: customer_problem, why_now, desired_outcome, obstacles_capabilities, evidence.
+`score` is an integer from 0 to 5.
+</output_format>
 """
+
+# Appended to the request when structured output is unavailable, so the field names are
+# still unambiguous. Filled with the JSON Schema of LLMAnalysis.
+SCHEMA_INSTRUCTION = (
+    "Structured output is unavailable for this request. Your entire reply must be a single "
+    "JSON object that conforms to this JSON Schema, using these exact key names:\n{schema}"
+)
 
 
 class LLMError(Exception):
@@ -250,6 +268,73 @@ def _salvage_onepager(raw, company: str, notes: list[str]) -> LLMOnePager:
     return LLMOnePager(**fields)
 
 
+_ELEMENT_ALIASES = {
+    NarrativeElement.CUSTOMER_PROBLEM: ("customer_problem", "customer_and_problem", "customer", "problem",
+                                        "customer_and_the_problem"),
+    NarrativeElement.WHY_NOW: ("why_now", "urgency", "timing"),
+    NarrativeElement.DESIRED_OUTCOME: ("desired_outcome", "outcome", "promised_land", "future_state"),
+    NarrativeElement.OBSTACLES_CAPABILITIES: ("obstacles_capabilities", "obstacles_and_capabilities",
+                                              "obstacles", "capabilities", "obstacles_to_capabilities"),
+    NarrativeElement.EVIDENCE: ("evidence", "proof", "traction"),
+}
+_ELEMENT_LOOKUP = {alias: element for element, aliases in _ELEMENT_ALIASES.items() for alias in aliases}
+_ELEMENTS_KEYS = ("elements", "narrative_elements", "element_assessments", "element_scores",
+                  "narrative_scores", "assessments", "scores")
+
+
+def _element_id(raw) -> str | None:
+    key = re.sub(r"[^a-z0-9]+", "_", str(raw).lower().replace("&", " and ")).strip("_")
+    key = re.sub(r"^\d+_", "", key)  # "1_customer_and_problem" -> "customer_and_problem"
+    element = _ELEMENT_LOOKUP.get(key)
+    return element.value if element else None
+
+
+def _score(raw) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)) and float(raw).is_integer():
+        return int(raw)
+    match = re.match(r"^\s*(\d+)(?:\.0+)?\s*(?:/\s*5)?\s*$", str(raw))
+    return int(match.group(1)) if match else None
+
+
+def _unwrap(data: dict) -> dict:
+    """Unwrap ``{"analysis": {...}}``-style envelopes around the expected object."""
+    if any(k in data for k in _ELEMENTS_KEYS):
+        return data
+    inner = [v for v in data.values() if isinstance(v, dict) and any(k in v for k in _ELEMENTS_KEYS)]
+    return inner[0] if len(inner) == 1 else data
+
+
+def _element_entries(data: dict) -> list[dict]:
+    """Element assessments in canonical shape, tolerating common variations in the response."""
+    raw = next((data[k] for k in _ELEMENTS_KEYS if k in data and data[k]), None)
+    if isinstance(raw, dict):  # {"why_now": {...}} or {"why_now": 3}
+        raw = [{"element": k, **v} if isinstance(v, dict) else {"element": k, "score": v}
+               for k, v in raw.items()]
+    if not isinstance(raw, list):
+        return []
+    entries = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = next((item[k] for k in ("element", "name", "element_name", "title", "id") if k in item), None)
+        element, score = _element_id(name) if name is not None else None, _score(item.get("score"))
+        if element is None or score is None:
+            continue
+        entries.append({
+            "element": element,
+            "score": score,
+            "rationale": str(item.get("rationale") or item.get("reasoning") or item.get("explanation") or ""),
+            "source_pages": [p for p in (item.get("source_pages") or item.get("pages") or [])
+                             if isinstance(p, int) and not isinstance(p, bool)],
+            "missing_or_weak": [str(x) for x in (item.get("missing_or_weak") or item.get("gaps") or [])
+                                if isinstance(x, (str, int, float))],
+            "improvement": str(item.get("improvement") or item.get("recommendation") or ""),
+        })
+    return entries
+
+
 def salvage_analysis(data) -> LLMAnalysis:
     """Build the best valid analysis from a partly malformed response.
 
@@ -260,9 +345,10 @@ def salvage_analysis(data) -> LLMAnalysis:
     """
     if not isinstance(data, dict):
         raise LLMResponseInvalid("The AI response did not match the expected structure (not an object).")
+    data = _unwrap(data)
     notes: list[str] = []
     elements: dict[NarrativeElement, ElementAssessment] = {}
-    for entry in data.get("elements") or []:
+    for entry in _element_entries(data):
         try:
             element = ElementAssessment.model_validate(entry)
         except ValidationError:
@@ -270,6 +356,8 @@ def salvage_analysis(data) -> LLMAnalysis:
         if 0 <= element.score <= 5 and element.element not in elements:
             elements[element.element] = element
     if not elements:
+        log.warning("No usable element scores; response top-level keys: %s; elements field type: %s",
+                    sorted(data)[:20], type(data.get("elements")).__name__)
         raise LLMResponseInvalid("The AI response did not match the expected structure (no valid element scores).")
     for element in NarrativeElement:
         if element not in elements:
@@ -374,6 +462,10 @@ class AnthropicAnalyzer:
 
     # The single network call; tests replace this method.
     def _request(self, content: list[dict], progress: Progress | None = None) -> str:
+        schema = anthropic.transform_schema(LLMAnalysis)
+        if not self._use_format:
+            content = content + [{"type": "text", "text": SCHEMA_INSTRUCTION.format(
+                schema=json.dumps(schema, separators=(",", ":")))}]
         kwargs: dict = {
             "model": self.settings.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
@@ -383,9 +475,7 @@ class AnthropicAnalyzer:
             "output_config": {"effort": self.settings.effort},
         }
         if self._use_format:
-            kwargs["output_config"]["format"] = {
-                "type": "json_schema", "schema": anthropic.transform_schema(LLMAnalysis),
-            }
+            kwargs["output_config"]["format"] = {"type": "json_schema", "schema": schema}
         if self.settings.fallbacks == "default":
             kwargs["betas"] = [FALLBACK_BETA]
             kwargs["fallbacks"] = "default"
@@ -424,8 +514,11 @@ class AnthropicAnalyzer:
                 return self._request(content, progress)
             except anthropic.BadRequestError as exc:
                 msg = str(getattr(exc, "message", exc)).lower()
-                if self._use_format and ("schema" in msg or "output_config" in msg or "format" in msg):
-                    log.warning("Structured output rejected; retrying with prompt-only JSON")
+                # Only a rejection of the JSON schema itself justifies dropping structured output;
+                # other 400s that merely mention "format" (e.g. an image format) must not.
+                if self._use_format and ("schema" in msg or "output_config.format" in msg):
+                    log.warning("Structured output rejected (%s); retrying with the schema in the prompt",
+                                msg[:200])
                     self._use_format = False
                     return self._request(content, progress)
                 if "fallback" in msg and self.settings.fallbacks == "default":
