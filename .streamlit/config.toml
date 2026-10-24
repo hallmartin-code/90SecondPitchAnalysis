@@ -1,0 +1,34 @@
+[server]
+maxUploadSize = 50
+# Serve ./static (favicon and other public assets) at /app/static/.
+enableStaticServing = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hide the developer "Deploy" toolbar for end users.
+toolbarMode = "viewer"
+
+# Dark navy UI with TEN Capital accents (coral / amber / teal from the logo mark).
+# Extra styling (glow, cards, gradient CTA) lives in src/pitch90/ui/theme.py.
+[theme]
+base = "dark"
+primaryColor = "#ED5644"
+backgroundColor = "#0B1526"
+secondaryBackgroundColor = "#16283F"
+textColor = "#F3F6FA"
+borderColor = "#1E354F"
+linkColor = "#4FC4D6"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+headingFont = "Sora:https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseRadius = "10px"
+buttonRadius = "12px"
+headingFontSizes = ["2rem", "1.45rem", "1.15rem"]
+blueBackgroundColor = "#123447"
+blueTextColor = "#A9E3EC"
+
+[theme.sidebar]
+backgroundColor = "#101E33"
+secondaryBackgroundColor = "#16283F"

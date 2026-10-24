@@ -1,0 +1,12 @@
+# Runtime dependencies, pinned to the versions the test suite passed with.
+anthropic==0.125.0
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.2
+pymupdf==1.28.2
+python-pptx==1.0.2
+reportlab==5.0.0
+pillow==12.3.0
+numpy==2.5.2
+rapidocr-onnxruntime==1.2.3
+streamlit==1.61.1
