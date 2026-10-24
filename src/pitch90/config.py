@@ -26,18 +26,22 @@ class Settings(BaseSettings):
         default="high", alias="PITCH90_EFFORT"
     )
     fallbacks: Literal["default", "off"] = Field(default="default", alias="PITCH90_FALLBACKS")
-    timeout_seconds: float = Field(default=300.0, alias="PITCH90_TIMEOUT_SECONDS")
+    # Per-read network timeout (the stream sends regular events, so a long gap means a stall).
+    timeout_seconds: float = Field(default=180.0, alias="PITCH90_TIMEOUT_SECONDS")
+    # Hard wall-clock limit for one analysis request, so a run can never hang indefinitely.
+    analysis_deadline_seconds: float = Field(default=600.0, alias="PITCH90_ANALYSIS_DEADLINE_SECONDS")
+    # Time budget for OCR and slide rendering during extraction; the rest is skipped and flagged.
+    extraction_budget_seconds: float = Field(default=120.0, alias="PITCH90_EXTRACTION_BUDGET_SECONDS")
     max_visual_pages: int = Field(default=12, alias="PITCH90_MAX_VISUAL_PAGES")
     max_upload_mb: int = Field(default=50, alias="PITCH90_MAX_UPLOAD_MB")
     max_pages: int = Field(default=150, alias="PITCH90_MAX_PAGES")
     words_per_minute: int = Field(default=140, alias="PITCH90_WORDS_PER_MINUTE")
     soffice_path: str | None = Field(default=None, alias="PITCH90_SOFFICE_PATH")
     report_template: Path | None = Field(default=None, alias="PITCH90_REPORT_TEMPLATE")
-    # Web deployment: sign-in gate and spend throttle.
+    # Web deployment: optional sign-in (off unless APP_PASSWORD is set) and spend throttle.
     app_password: SecretStr | None = Field(default=None, alias="APP_PASSWORD")
     app_username: str = Field(default="ten", alias="APP_USERNAME")
     max_concurrent_analyses: int = Field(default=2, alias="PITCH90_MAX_CONCURRENT")
-    railway_environment: str | None = Field(default=None, alias="RAILWAY_ENVIRONMENT")
 
     # Result emails via Resend: off unless RESEND_API_KEY is set.
     resend_api_key: SecretStr | None = Field(default=None, alias="RESEND_API_KEY")

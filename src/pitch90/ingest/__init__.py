@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from pitch90.config import Settings
@@ -61,9 +62,10 @@ def _summarise(deck: ExtractedDeck) -> None:
         ))
     if not any(u.all_text.strip() for u in deck.units):
         deck.warnings.append(ExtractionWarning(
-            severity="error",
+            severity="warning",
             message="No readable text was extracted from any "
-                    f"{label}. Analysis would rely entirely on images.",
+                    f"{label}. The analysis will still run, relying on the {label} images that were "
+                    "captured, and will report what it could not read.",
         ))
     injection = scan_for_instructions(deck)
     if injection:
@@ -112,7 +114,8 @@ def extract_deck(filename: str, data: bytes, settings: Settings) -> ExtractedDec
             converted = True
 
         if kind == "pdf":
-            deck = extract_pdf(data, name, settings.max_pages)
+            deck = extract_pdf(data, name, settings.max_pages,
+                               budget_seconds=settings.extraction_budget_seconds)
             unrendered = [u.number for u in deck.units if u.needs_visual and u.number not in deck.images]
             if unrendered:
                 deck.warnings.append(ExtractionWarning(
@@ -121,11 +124,14 @@ def extract_deck(filename: str, data: bytes, settings: Settings) -> ExtractedDec
                     units=unrendered,
                 ))
         else:
+            started = time.monotonic()
             deck, pictures = extract_pptx(data, name, settings.max_pages,
+                                          budget_seconds=settings.extraction_budget_seconds,
                                           source_type="ppt" if converted else "pptx")
             deck.converted_from_ppt = converted
             needed = {u.number for u in deck.units if u.needs_visual}
-            if needed and soffice:
+            within_budget = time.monotonic() - started < settings.extraction_budget_seconds
+            if needed and soffice and within_budget:
                 try:
                     pptx_file = work / "render.pptx"
                     pptx_file.write_bytes(data)

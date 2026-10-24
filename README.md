@@ -46,8 +46,9 @@ Then open http://localhost:8501. The workflow:
 2. **Review extraction.** Warnings appear first (OCR'd, image-only, hidden or unreadable
    slides/pages, embedded AI instructions). Then browse the content per slide, with speaker notes
    shown separately from visible content.
-3. **Run the analysis.** API mode requires you to tick a consent box: deck text, notes and up to
-   `PITCH90_MAX_VISUAL_PAGES` slide images are sent to Anthropic. Demo mode makes no network calls.
+3. **Run the analysis.** One click sends the deck text, notes and up to `PITCH90_MAX_VISUAL_PAGES`
+   slide images to Anthropic; the notice above the button says so. It runs even when extraction was
+   incomplete, and a progress panel shows elapsed time. Demo mode makes no network calls.
 4. **Review findings.** You get the score out of 25 and a percentage, an assessment of each
    element, the three strongest points and three priority fixes, inconsistencies, gaps and
    extraction limitations, and a 180–210-word pitch with its duration at the configurable
@@ -75,12 +76,14 @@ explicitly, set `PITCH90_SOFFICE_PATH`.
 | `PITCH90_MODEL` | `claude-opus-5-5` | Model for analysis |
 | `PITCH90_EFFORT` | `high` | Reasoning effort |
 | `PITCH90_FALLBACKS` | `default` | Server-side refusal fallback (`off` to disable) |
-| `PITCH90_TIMEOUT_SECONDS` | `300` | Request timeout |
+| `PITCH90_TIMEOUT_SECONDS` | `180` | Network stall timeout |
+| `PITCH90_ANALYSIS_DEADLINE_SECONDS` | `600` | Hard limit for one analysis |
+| `PITCH90_EXTRACTION_BUDGET_SECONDS` | `120` | Time for OCR/slide rendering; the rest is flagged and analysed from text |
 | `PITCH90_MAX_VISUAL_PAGES` | `12` | Slide/page images sent per analysis |
 | `PITCH90_MAX_UPLOAD_MB` / `PITCH90_MAX_PAGES` | `50` / `150` | Upload limits (also set `server.maxUploadSize` in `.streamlit/config.toml`) |
 | `PITCH90_WORDS_PER_MINUTE` | `140` | Default speaking rate |
 | `PITCH90_REPORT_TEMPLATE` | `templates/analysis_report.md` | Analysis report structure template |
-| `APP_USERNAME` / `APP_PASSWORD` | `ten` / – | Sign-in gate (enabled when a password is set) |
+| `APP_USERNAME` / `APP_PASSWORD` | `ten` / – | Optional sign-in; off unless a password is set |
 | `PITCH90_MAX_CONCURRENT` | `2` | Simultaneous paid analyses across all users |
 | `RESEND_API_KEY` | – | Turns on result emails (summary + one-pager + report + JSON) |
 | `REPORT_EMAIL_TO` / `REPORT_EMAIL_FROM` | `Info@tencapital.group` / `pitch90@tencapital.group` | Recipients (comma-separated) and sender; the sender must be on a domain verified in Resend |

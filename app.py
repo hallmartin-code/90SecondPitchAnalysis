@@ -26,7 +26,7 @@ from pitch90.framework import ARTICLE_URL, ELEMENT_GUIDANCE, ELEMENT_TITLES, FRA
 from pitch90.ingest import ConversionFailed, ConversionUnavailable, UploadError, extract_deck  # noqa: E402
 from pitch90.ingest.convert import find_soffice  # noqa: E402
 from pitch90.ingest.ocr import ocr_available  # noqa: E402
-from pitch90.llm import AnthropicAnalyzer, LLMError  # noqa: E402
+from pitch90.llm import AnthropicAnalyzer, LLMError, select_images  # noqa: E402
 from pitch90.mailer import Attachment, EmailOutcome  # noqa: E402
 from pitch90.mailer import describe as describe_email  # noqa: E402
 from pitch90.mailer import send as send_email  # noqa: E402
@@ -163,9 +163,6 @@ with st.sidebar:
     if st.button("Start over", width="stretch"):
         reset()
         st.rerun()
-    if settings.railway_environment and not settings.auth_enabled:
-        st.error("This deployment has no APP_PASSWORD: anyone with the URL can run paid analyses "
-                 "on your API key. Set APP_PASSWORD in Railway.")
 
 # ------------------------------------------------------------------ 1. upload (hero card)
 
@@ -266,56 +263,85 @@ with st.expander(f"View content by {label} (original numbering)"):
 # ------------------------------------------------------------------ 3. analyse
 
 st.header("3 · Run the analysis")
+gaps = [w for w in deck.warnings if w.kind == "extraction" and w.severity != "info"]
+if gaps:
+    st.info(f"Some content was not fully extracted ({len(gaps)} issue(s) listed above). You can still run "
+            "the analysis: it uses everything that was extracted and reports what it could not read.")
+
+
+def request_run() -> None:
+    # Set before the button is redrawn, so the button shows disabled while the analysis runs
+    # and a second click cannot restart it.
+    ss.run_requested = True
+
+
+running = bool(ss.get("run_requested"))
 if demo_mode:
     if not is_sample_deck(deck):
-        st.warning("Demo mode only analyses the bundled synthetic sample deck. Load it, or switch to API "
-                   "mode (requires ANTHROPIC_API_KEY) to analyse this deck.")
-    run = st.button("Run demo analysis", type="primary", disabled=not is_sample_deck(deck))
+        st.warning("Demo mode only analyses the bundled synthetic sample deck. Switch the sidebar to "
+                   "*Anthropic API* to analyse this deck.")
+    st.button("Run demo analysis", type="primary", on_click=request_run,
+              disabled=running or not is_sample_deck(deck))
 else:
-    n_images = min(len(deck.images), settings.max_visual_pages)
-    consent = st.checkbox(
-        f"I understand that the extracted text and speaker notes of this deck"
+    n_images = len(select_images(deck, settings.max_visual_pages))
+    st.caption(
+        "Clicking **Run analysis** sends the extracted text and speaker notes"
         + (f", plus {n_images} {label} image(s)," if n_images else "")
-        + f" will be sent to Anthropic's API (model {settings.model}) for analysis."
+        + f" to Anthropic's API (model `{settings.model}`). Nothing is sent before you click."
     )
     if not settings.has_api_key:
-        st.warning("No ANTHROPIC_API_KEY is configured. Add it to a `.env` file (see `.env.example`) and "
-                   "restart, or use demo mode. A Claude Code or claude.ai subscription does not include "
-                   "API access; create an API key at platform.claude.com.")
-    run = st.button("Run analysis", type="primary", disabled=not (consent and settings.has_api_key))
+        st.warning("No ANTHROPIC_API_KEY is configured. Add it to a `.env` file (see `.env.example`) or to "
+                   "the Railway variables and restart, or use demo mode. A Claude Code or claude.ai "
+                   "subscription does not include API access; create an API key at platform.claude.com.")
+    st.button("Run analysis", type="primary", on_click=request_run,
+              disabled=running or not settings.has_api_key)
 
-if run:
+if ss.get("run_requested"):
     reset(keep_deck=True)
+    status = st.status("Running the analysis… this usually takes one to five minutes.", expanded=True)
+    with status:
+        line = st.empty()
+
+    def progress(phase: str, elapsed: float, chars: int) -> None:
+        line.write(f"{phase} · {elapsed:.0f}s elapsed" + (f" · {chars:,} characters received" if chars else ""))
+
     try:
-        with st.spinner("Analysing the narrative… this can take a few minutes."):
-            if demo_mode:
-                llm, sent, model = demo_analysis(deck), [], None
-            else:
-                slots = analysis_slots()
-                if not slots.acquire(timeout=1):
-                    raise LLMError(f"{settings.max_concurrent_analyses} analyses are already running. "
-                                   "Please try again in a few minutes.")
-                try:
-                    llm, sent = AnthropicAnalyzer(settings).analyze(deck)
-                finally:
-                    slots.release()
-                model = settings.model
-            result = finalize(llm, deck, mode="demo" if demo_mode else "api", model=model,
-                              words_per_minute=int(wpm), images_sent=sent)
+        if demo_mode:
+            llm, sent, model = demo_analysis(deck), [], None
+        else:
+            slots = analysis_slots()
+            if not slots.acquire(timeout=1):
+                raise LLMError(f"{settings.max_concurrent_analyses} analyses are already running. "
+                               "Please try again in a few minutes.")
+            try:
+                progress("Sending the deck to Claude", 0.0, 0)
+                llm, sent = AnthropicAnalyzer(settings).analyze(deck, progress)
+            finally:
+                slots.release()
+            model = settings.model
+        line.write("Checking citations and building the results…")
+        result = finalize(llm, deck, mode="demo" if demo_mode else "api", model=model,
+                          words_per_minute=int(wpm), images_sent=sent)
         ss.result = result
         ss.facts = [f.model_copy(deep=True) for f in result.facts]
         ss.onepager = result.onepager.model_copy(deep=True)
         ss.onepager_orig = result.onepager.model_copy(deep=True)
         ss.edits, ss.shorten_log = {}, []
         if settings.email_enabled and (not demo_mode or settings.email_demo_runs):
-            with st.spinner(f"Emailing results to {settings.report_email_to}…"):
-                ss.email_outcome = email_results(result, deck)
-        st.rerun()  # refresh the step tracker, which was drawn before the analysis ran
+            line.write(f"Emailing results to {settings.report_email_to}…")
+            ss.email_outcome = email_results(result, deck)
+        status.update(label="Analysis complete", state="complete", expanded=False)
+        ss.run_requested = False
+        st.rerun()  # redraw the step tracker and re-enable the button
     except (LLMError, DemoUnavailable) as exc:
+        status.update(label="Analysis stopped", state="error", expanded=False)
         st.error(str(exc))
     except Exception:
         logging.exception("Analysis failed")
+        status.update(label="Analysis stopped", state="error", expanded=False)
         st.error("The analysis failed unexpectedly. Please try again.")
+    finally:
+        ss.run_requested = False
 
 result: AnalysisResult | None = ss.get("result")
 if result is None:

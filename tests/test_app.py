@@ -127,3 +127,37 @@ def test_results_emailed_after_analysis(monkeypatch):
         assert any("Results emailed" in s.value for s in at.success)
     finally:
         get_settings.cache_clear()
+
+
+def test_api_mode_proceeds_from_extraction_to_findings(monkeypatch):
+    """No consent checkbox or other gate: one click runs the analysis to completion."""
+    from pitch90.demo import demo_analysis
+    from pitch90.llm import AnthropicAnalyzer
+
+    calls = []
+
+    def fake_analyze(self, deck, progress=None):
+        calls.append(deck.filename)
+        if progress:
+            progress("Writing the analysis", 1.0, 100)
+        return demo_analysis(deck), []
+
+    monkeypatch.setattr(AnthropicAnalyzer, "analyze", fake_analyze)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("RESEND_API_KEY", "")
+    from pitch90.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        at = AppTest.from_file(APP, default_timeout=300)
+        at.run()
+        assert at.sidebar.radio[0].value == "Anthropic API"
+        click(at, "Try the synthetic sample deck")
+        assert not at.checkbox  # no consent gate
+        click(at, "Run analysis")
+        assert not at.exception
+        assert calls == ["tidewell_sample_deck.pptx"]
+        assert any(m.value == "17 / 25" for m in at.metric)
+        assert not next(b for b in at.button if b.label == "Run analysis").disabled
+    finally:
+        get_settings.cache_clear()

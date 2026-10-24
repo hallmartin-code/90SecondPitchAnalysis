@@ -11,19 +11,37 @@ import base64
 import json
 import logging
 import re
+import time
+from typing import Callable
 
 import anthropic
 from pydantic import ValidationError
 
 from pitch90.config import Settings
 from pitch90.framework import FRAMEWORK_SUMMARY, RUBRIC
-from pitch90.models import ExtractedDeck, LLMAnalysis
+from pitch90.models import (
+    NOT_PROVIDED,
+    CitedPoint,
+    ElementAssessment,
+    ExtractedDeck,
+    ExtractionLimitation,
+    Inconsistency,
+    LLMAnalysis,
+    LLMFact,
+    LLMOnePager,
+    NarrativeElement,
+    ObstacleCapability,
+    OnePagerSection,
+    TeamMember,
+    VisualObservation,
+)
 from pitch90.scoring import ScoreError, validate_elements
 
 log = logging.getLogger(__name__)
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-MAX_OUTPUT_TOKENS = 32000
+MAX_OUTPUT_TOKENS = 64000
+MAX_FACTS = 40
 
 SYSTEM_PROMPT = f"""\
 You are a senior startup investment analyst. You evaluate how well an investor pitch
@@ -57,6 +75,7 @@ draft an investor-facing one-page summary from the deck's own content.
   stated; explain in `note`), "missing" (the deck does not provide it), "conflicting"
   (the deck gives different values). When the deck gives different values for the same
   metric and period, record each as a separate fact with the same `key`; never choose one.
+- Record at most 40 facts, choosing the most material ones, and keep every string concise.
 - Include missing facts for important investor items the deck omits (e.g. fundraising
   target, use of funds, team, traction, market size, business model).
 - If page images are provided, report what you read from them in `visual_observations`
@@ -90,6 +109,23 @@ class MissingCredentials(LLMError):
 
 class LLMResponseInvalid(LLMError):
     pass
+
+
+class OutputTruncated(LLMResponseInvalid):
+    """The response hit the output-token limit; retried with a more concise brief."""
+
+
+class AnalysisTimeout(LLMError):
+    """The whole analysis exceeded its wall-clock deadline."""
+
+
+# progress(phase, elapsed_seconds, characters_received)
+Progress = Callable[[str, float, int], None]
+
+CONCISE_RETRY = (
+    "Your previous answer to this request exceeded the output limit. Be more concise this time: "
+    "at most 20 facts, rationales of two sentences, one-pager sections under 50 words."
+)
 
 
 _TAG_RE = re.compile(r"</?\s*(deck|unit|visible_text|speaker_notes|tables|chart_data|ocr_text|extraction_warnings)\b[^>]*>", re.I)
@@ -129,11 +165,26 @@ def deck_to_prompt(deck: ExtractedDeck) -> str:
     return "\n".join(lines)
 
 
+def select_images(deck: ExtractedDeck, max_images: int) -> list[int]:
+    """Pick which unit images to send: text-poor pages first, then charts, then the rest."""
+    def priority(number: int) -> tuple[int, int]:
+        unit = deck.unit(number)
+        reason = (unit.visual_reason or "") if unit else ""
+        if "little extractable text" in reason:
+            return 0, number
+        if "chart" in reason or "diagram" in reason:
+            return 1, number
+        return 2, number
+
+    chosen = sorted(deck.images, key=priority)[:max(0, max_images)]
+    return sorted(chosen)
+
+
 def build_content(deck: ExtractedDeck, max_images: int) -> tuple[list[dict], list[int]]:
     """Return message content blocks and the unit numbers whose images were included."""
     content: list[dict] = []
     sent: list[int] = []
-    for number in sorted(deck.images)[:max_images]:
+    for number in select_images(deck, max_images):
         content.append({"type": "text", "text": f"Image of {deck.unit_label} {number}:"})
         content.append({
             "type": "image",
@@ -150,8 +201,117 @@ def build_content(deck: ExtractedDeck, max_images: int) -> tuple[list[dict], lis
     return content, sent
 
 
+def _valid_items(raw, model, field: str, notes: list[str]) -> list:
+    """Keep the list entries that validate; note how many were dropped."""
+    if not isinstance(raw, list):
+        if raw is not None:
+            notes.append(f"'{field}' was malformed and was left empty.")
+        return []
+    kept = []
+    for entry in raw:
+        try:
+            kept.append(model.model_validate(entry))
+        except ValidationError:
+            pass
+    if len(kept) < len(raw):
+        notes.append(f"{len(raw) - len(kept)} malformed '{field}' item(s) from the AI response were dropped.")
+    return kept
+
+
+def _strings(raw, field: str, notes: list[str]) -> list[str]:
+    if not isinstance(raw, list):
+        if raw is not None:
+            notes.append(f"'{field}' was malformed and was left empty.")
+        return []
+    return [str(x) for x in raw if isinstance(x, (str, int, float)) and str(x).strip()]
+
+
+def _salvage_onepager(raw, company: str, notes: list[str]) -> LLMOnePager:
+    try:
+        return LLMOnePager.model_validate(raw)
+    except ValidationError:
+        pass
+    raw = raw if isinstance(raw, dict) else {}
+    missing = OnePagerSection(text=NOT_PROVIDED, citations=[])
+    fields: dict = {}
+    bad: list[str] = []
+    for name, info in LLMOnePager.model_fields.items():
+        if info.annotation is OnePagerSection:
+            try:
+                fields[name] = OnePagerSection.model_validate(raw.get(name))
+            except ValidationError:
+                fields[name] = missing.model_copy()
+                bad.append(name)
+    fields["team"] = _valid_items(raw.get("team"), TeamMember, "onepager.team", notes)
+    fields["company_name"] = str(raw.get("company_name") or company)
+    fields["website"] = str(raw.get("website") or NOT_PROVIDED)
+    if bad:
+        notes.append(f"One-pager section(s) {', '.join(bad)} were malformed and set to '{NOT_PROVIDED}'.")
+    return LLMOnePager(**fields)
+
+
+def salvage_analysis(data) -> LLMAnalysis:
+    """Build the best valid analysis from a partly malformed response.
+
+    Valid parts are kept; malformed items are dropped and recorded in ``salvage_notes``.
+    Elements the model did not score validly are added with score 0 and an explicit
+    "not assessed" rationale, so the total stays honest about what is missing. Raises
+    LLMResponseInvalid only when no element at all was assessed.
+    """
+    if not isinstance(data, dict):
+        raise LLMResponseInvalid("The AI response did not match the expected structure (not an object).")
+    notes: list[str] = []
+    elements: dict[NarrativeElement, ElementAssessment] = {}
+    for entry in data.get("elements") or []:
+        try:
+            element = ElementAssessment.model_validate(entry)
+        except ValidationError:
+            continue
+        if 0 <= element.score <= 5 and element.element not in elements:
+            elements[element.element] = element
+    if not elements:
+        raise LLMResponseInvalid("The AI response did not match the expected structure (no valid element scores).")
+    for element in NarrativeElement:
+        if element not in elements:
+            notes.append(f"The AI response had no valid assessment for '{element.value}'; it is shown as "
+                         "not assessed (0/5). Re-run the analysis to score it.")
+            elements[element] = ElementAssessment(
+                element=element, score=0, source_pages=[], improvement="Re-run the analysis.",
+                rationale="Not assessed: the AI response did not include a valid assessment for this element.",
+                missing_or_weak=["Assessment missing from the AI response"],
+            )
+    company = str(data.get("company_name") or "Unnamed company")
+    script = data.get("pitch_script")
+    if not isinstance(script, str):
+        notes.append("The pitch script was missing from the AI response.")
+        script = ""
+    analysis = LLMAnalysis(
+        company_name=company,
+        facts=_valid_items(data.get("facts"), LLMFact, "facts", notes)[:MAX_FACTS],
+        elements=[elements[e] for e in NarrativeElement],
+        obstacle_capability_pairs=_valid_items(data.get("obstacle_capability_pairs"), ObstacleCapability,
+                                               "obstacle_capability_pairs", notes),
+        strongest_points=_valid_items(data.get("strongest_points"), CitedPoint, "strongest_points", notes),
+        priority_fixes=_strings(data.get("priority_fixes"), "priority_fixes", notes),
+        inconsistencies=_valid_items(data.get("inconsistencies"), Inconsistency, "inconsistencies", notes),
+        information_gaps=_strings(data.get("information_gaps"), "information_gaps", notes),
+        extraction_limitations=_valid_items(data.get("extraction_limitations"), ExtractionLimitation,
+                                            "extraction_limitations", notes),
+        visual_observations=_valid_items(data.get("visual_observations"), VisualObservation,
+                                         "visual_observations", notes),
+        pitch_script=script,
+        onepager=_salvage_onepager(data.get("onepager"), company, notes),
+    )
+    analysis._salvage_notes = notes
+    return analysis
+
+
 def parse_response(text: str) -> LLMAnalysis:
-    """Validate a model response; raise LLMResponseInvalid with a concise reason."""
+    """Validate a model response, salvaging valid parts of a partly malformed one.
+
+    Raises LLMResponseInvalid only when the text is not JSON or contains no usable
+    element assessments.
+    """
     cleaned = text.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.S)
     if fence:
@@ -162,18 +322,11 @@ def parse_response(text: str) -> LLMAnalysis:
         raise LLMResponseInvalid(f"The AI response was not valid JSON ({exc.msg}).") from exc
     try:
         result = LLMAnalysis.model_validate(data)
-    except ValidationError as exc:
-        first = exc.errors()[0]
-        where = ".".join(str(p) for p in first["loc"])
-        raise LLMResponseInvalid(
-            f"The AI response did not match the expected structure ({exc.error_count()} "
-            f"problem(s), first at '{where}': {first['msg']})."
-        ) from exc
-    try:
         validate_elements(result.elements)
-    except ScoreError as exc:
-        raise LLMResponseInvalid(f"The AI response had invalid scores: {exc}") from exc
-    return result
+        return result
+    except (ValidationError, ScoreError) as exc:
+        log.warning("Response failed strict validation; salvaging valid parts (%s)", type(exc).__name__)
+    return salvage_analysis(data)
 
 
 def translate_api_error(exc: anthropic.APIError, settings: Settings) -> LLMError:
@@ -220,7 +373,7 @@ class AnthropicAnalyzer:
         self._use_format = True
 
     # The single network call; tests replace this method.
-    def _request(self, content: list[dict]) -> str:
+    def _request(self, content: list[dict], progress: Progress | None = None) -> str:
         kwargs: dict = {
             "model": self.settings.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
@@ -236,32 +389,49 @@ class AnthropicAnalyzer:
         if self.settings.fallbacks == "default":
             kwargs["betas"] = [FALLBACK_BETA]
             kwargs["fallbacks"] = "default"
+        start = time.monotonic()
+        deadline = start + self.settings.analysis_deadline_seconds
+        last_report, chars = 0.0, 0
         with self.client.beta.messages.stream(**kwargs) as stream:
+            for event in stream:
+                now = time.monotonic()
+                if now > deadline:
+                    raise AnalysisTimeout(
+                        f"The analysis did not finish within {self.settings.analysis_deadline_seconds:.0f} "
+                        "seconds and was stopped. Try again, or raise PITCH90_ANALYSIS_DEADLINE_SECONDS."
+                    )
+                delta = getattr(event, "delta", None)
+                if getattr(delta, "type", None) == "text_delta":
+                    chars += len(delta.text)
+                if progress and now - last_report >= 1.0:
+                    last_report = now
+                    phase = "Writing the analysis" if chars else "Claude is reading the deck"
+                    progress(phase, now - start, chars)
             message = stream.get_final_message()
         if message.stop_reason == "refusal":
             raise LLMError("The AI provider declined to analyse this deck. Try demo mode or a different file.")
         if message.stop_reason == "max_tokens":
-            raise LLMResponseInvalid("The AI response was cut off before completion (output limit reached).")
+            raise OutputTruncated("The AI response was cut off before completion (output limit reached).")
         text = "".join(b.text for b in message.content if getattr(b, "type", None) == "text")
         if not text.strip():
             raise LLMResponseInvalid("The AI response contained no text.")
         log.info("Model response received: %d characters, stop_reason=%s", len(text), message.stop_reason)
         return text
 
-    def _call(self, content: list[dict]) -> str:
+    def _call(self, content: list[dict], progress: Progress | None = None) -> str:
         try:
             try:
-                return self._request(content)
+                return self._request(content, progress)
             except anthropic.BadRequestError as exc:
                 msg = str(getattr(exc, "message", exc)).lower()
                 if self._use_format and ("schema" in msg or "output_config" in msg or "format" in msg):
                     log.warning("Structured output rejected; retrying with prompt-only JSON")
                     self._use_format = False
-                    return self._request(content)
+                    return self._request(content, progress)
                 if "fallback" in msg and self.settings.fallbacks == "default":
                     log.warning("Fallbacks rejected for this model; retrying without them")
                     self.settings = self.settings.model_copy(update={"fallbacks": "off"})
-                    return self._request(content)
+                    return self._request(content, progress)
                 raise
         except anthropic.APIError as exc:
             raise translate_api_error(exc, self.settings) from exc
@@ -275,15 +445,19 @@ class AnthropicAnalyzer:
         name = getattr(info, "display_name", None) or self.settings.model
         return f"Connected: API key accepted and model '{name}' is available."
 
-    def analyze(self, deck: ExtractedDeck) -> tuple[LLMAnalysis, list[int]]:
+    def analyze(self, deck: ExtractedDeck, progress: Progress | None = None) -> tuple[LLMAnalysis, list[int]]:
         content, sent = build_content(deck, self.settings.max_visual_pages)
         log.info("Requesting analysis: %d units, %d images", len(deck.units), len(sent))
         last_error: LLMResponseInvalid | None = None
         for attempt in range(2):
-            text = self._call(content)
+            if progress and attempt:
+                progress("Retrying with a more concise brief", 0.0, 0)
             try:
+                text = self._call(content, progress)
                 return parse_response(text), sent
             except LLMResponseInvalid as exc:
-                log.warning("Invalid model response on attempt %d: %s", attempt + 1, exc)
+                log.warning("Unusable model response on attempt %d: %s", attempt + 1, exc)
                 last_error = exc
+                if isinstance(exc, OutputTruncated):
+                    content = content + [{"type": "text", "text": CONCISE_RETRY}]
         raise LLMResponseInvalid(f"{last_error} The analysis was attempted twice; please retry.")

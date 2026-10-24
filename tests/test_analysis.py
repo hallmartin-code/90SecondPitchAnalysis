@@ -53,3 +53,15 @@ def test_visual_observation_without_image_discarded(sample_deck, demo_llm):
                                VisualObservation(page=3, observation="invented")]
     result = run(llm, sample_deck, images=[7])
     assert [v.page for v in result.visual_observations] == [7]
+
+
+def test_salvage_notes_become_validation_warnings(sample_deck, demo_json):
+    import json
+
+    from pitch90.llm import parse_response
+
+    demo_json["elements"] = demo_json["elements"][:4]
+    llm = parse_response(json.dumps(demo_json))
+    result = run(llm, sample_deck)
+    assert result.total_score == 14  # evidence not assessed -> 0
+    assert any("not assessed" in w for w in result.validation_warnings)

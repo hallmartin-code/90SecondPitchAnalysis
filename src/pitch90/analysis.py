@@ -91,7 +91,8 @@ def finalize(
     words_per_minute: int,
     images_sent: list[int],
 ) -> AnalysisResult:
-    warnings: list[str] = []
+    # Parts of the model response that were malformed and dropped (empty when it was fully valid).
+    warnings: list[str] = list(llm.salvage_notes)
     valid = deck.unit_numbers
     label = deck.unit_label
 

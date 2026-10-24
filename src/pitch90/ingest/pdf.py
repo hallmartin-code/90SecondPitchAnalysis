@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 import pymupdf
 
@@ -67,12 +68,66 @@ def _tables(page: pymupdf.Page) -> list[list[list[str]]]:
     return tables
 
 
+def _extract_page(page: pymupdf.Page, number: int, allow_slow: bool) -> tuple[UnitContent, bytes | None, bool]:
+    """Extract one page. Returns (unit, rendered image or None, OCR-was-unavailable)."""
+    unit = UnitContent(number=number)
+    try:
+        unit.text = clean_text(page.get_text("text"))
+    except Exception:
+        unit.warnings.append("Text layer could not be read.")
+    unit.tables = _tables(page)
+    try:
+        info = page.get_image_info()
+    except Exception:
+        info = []
+    unit.image_count = len(info)
+    page_area = max(page.rect.width * page.rect.height, 1)
+    coverage = sum(pymupdf.Rect(i["bbox"]).intersect(page.rect).get_area() for i in info) / page_area
+    try:
+        drawings = len(page.get_drawings())
+    except Exception:
+        drawings = 0
+
+    no_ocr = False
+    low_text = _alnum(unit.text) < MIN_TEXT_CHARS
+    if low_text and allow_slow:
+        ocr = ocr_image(page.get_pixmap(dpi=200, alpha=False).tobytes("png"))
+        if ocr is None:
+            no_ocr = True
+            unit.warnings.append("Little extractable text and OCR is unavailable.")
+        else:
+            unit.ocr_text = ocr
+            if ocr:
+                unit.warnings.append("Text recovered by OCR; check for recognition errors.")
+            else:
+                unit.warnings.append("No readable text found, even with OCR.")
+
+    reasons = []
+    if low_text:
+        reasons.append("little extractable text")
+    if coverage >= IMAGE_COVERAGE_VISUAL:
+        reasons.append(f"images cover {coverage:.0%} of the page")
+    if drawings >= DRAWINGS_VISUAL or (drawings >= DRAWINGS_VISUAL_NO_TABLE and not unit.tables):
+        reasons.append("likely chart or diagram")
+    image = None
+    if reasons:
+        unit.needs_visual = True
+        unit.visual_reason = "; ".join(reasons)
+        if allow_slow:
+            try:
+                image = render_page(page)
+            except Exception:
+                unit.warnings.append("Page could not be rendered for visual review.")
+    return unit, image, no_ocr
+
+
 def extract_pdf(
     data: bytes,
     filename: str,
     max_pages: int,
     unit_label: str = "page",
     source_type: str = "pdf",
+    budget_seconds: float = 120.0,
 ) -> ExtractedDeck:
     doc = open_pdf(data)
     try:
@@ -85,60 +140,44 @@ def extract_pdf(
         warnings: list[ExtractionWarning] = []
         ocr_missing: list[int] = []
 
+        deadline = time.monotonic() + budget_seconds
+        skipped: list[int] = []
+        failed: list[int] = []
         for index, page in enumerate(doc):
             number = index + 1
-            unit = UnitContent(number=number)
+            allow_slow = time.monotonic() < deadline
             try:
-                unit.text = clean_text(page.get_text("text"))
+                unit, image, no_ocr = _extract_page(page, number, allow_slow)
             except Exception:
-                unit.warnings.append("Text layer could not be read.")
-            unit.tables = _tables(page)
-            try:
-                info = page.get_image_info()
-            except Exception:
-                info = []
-            unit.image_count = len(info)
-            page_area = max(page.rect.width * page.rect.height, 1)
-            coverage = sum(
-                pymupdf.Rect(i["bbox"]).intersect(page.rect).get_area() for i in info
-            ) / page_area
-            try:
-                drawings = len(page.get_drawings())
-            except Exception:
-                drawings = 0
-
-            low_text = _alnum(unit.text) < MIN_TEXT_CHARS
-            if low_text:
-                ocr = ocr_image(page.get_pixmap(dpi=200, alpha=False).tobytes("png"))
-                if ocr is None:
-                    ocr_missing.append(number)
-                    unit.warnings.append("Little extractable text and OCR is unavailable.")
-                else:
-                    unit.ocr_text = ocr
-                    if ocr:
-                        unit.warnings.append("Text recovered by OCR; check for recognition errors.")
-                    else:
-                        unit.warnings.append("No readable text found, even with OCR.")
-
-            reasons = []
-            if low_text:
-                reasons.append("little extractable text")
-            if coverage >= IMAGE_COVERAGE_VISUAL:
-                reasons.append(f"images cover {coverage:.0%} of the page")
-            if drawings >= DRAWINGS_VISUAL or (drawings >= DRAWINGS_VISUAL_NO_TABLE and not unit.tables):
-                reasons.append("likely chart or diagram")
-            if reasons:
-                unit.needs_visual = True
-                unit.visual_reason = "; ".join(reasons)
-                try:
-                    images[number] = render_page(page)
-                except Exception:
-                    unit.warnings.append("Page could not be rendered for visual review.")
+                # One unreadable page must not stop the deck: keep a placeholder and move on.
+                log.warning("Page %d could not be processed", number)
+                unit, image, no_ocr = UnitContent(number=number, warnings=["Page could not be read."]), None, False
+                failed.append(number)
+            if no_ocr:
+                ocr_missing.append(number)
+            if image is not None:
+                images[number] = image
+            if not allow_slow and (unit.needs_visual or _alnum(unit.text) < MIN_TEXT_CHARS):
+                skipped.append(number)
             units.append(unit)
+        if skipped:
+            warnings.append(ExtractionWarning(
+                severity="warning",
+                message=f"The extraction time budget ({budget_seconds:.0f}s) ran out, so OCR and page "
+                        "rendering were skipped for these pages. Analysis continues with their text layer only.",
+                units=skipped,
+            ))
+        if failed:
+            warnings.append(ExtractionWarning(
+                severity="warning",
+                message="These pages could not be processed and are treated as empty. Analysis continues "
+                        "with the rest of the document.",
+                units=failed,
+            ))
 
         if ocr_missing:
             warnings.append(ExtractionWarning(
-                severity="error",
+                severity="warning",
                 message="OCR is unavailable (install rapidocr-onnxruntime); these pages have "
                         "little or no extractable text and were not read.",
                 units=ocr_missing,

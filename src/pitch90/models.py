@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 NOT_PROVIDED = "Not provided"
 
@@ -264,6 +264,12 @@ class LLMAnalysis(BaseModel):
     visual_observations: list[VisualObservation]
     pitch_script: str = Field(description="Spoken pitch of 180-210 words using only supported facts.")
     onepager: LLMOnePager
+    # Notes about malformed parts dropped while salvaging a response (not part of the schema).
+    _salvage_notes: list[str] = PrivateAttr(default_factory=list)
+
+    @property
+    def salvage_notes(self) -> list[str]:
+        return self._salvage_notes
 
 
 # --------------------------------------------------------------------------- results

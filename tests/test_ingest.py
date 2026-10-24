@@ -187,3 +187,42 @@ def test_slide_renders_map_to_original_numbers_despite_hidden_slide(settings):
     from pitch90.ingest.ocr import ocr_image
 
     assert "three" in (ocr_image(deck.images[3]) or "").lower()
+
+
+def test_unreadable_slide_does_not_stop_extraction(pptx_bytes, settings, monkeypatch):
+    pptx_mod = importlib.import_module("pitch90.ingest.pptx")
+    real = pptx_mod._extract_slide
+
+    def flaky(slide, number, *args):
+        if number == 2:
+            raise ValueError("corrupt shape")
+        return real(slide, number, *args)
+
+    monkeypatch.setattr(pptx_mod, "_extract_slide", flaky)
+    deck = extract_deck("deck.pptx", pptx_bytes, settings)
+    assert [u.number for u in deck.units] == [1, 2, 3, 4]
+    assert "Visible body text" in deck.unit(1).text
+    assert any(2 in w.units and "could not be processed" in w.message for w in deck.warnings)
+
+
+def test_unreadable_page_does_not_stop_extraction(pdf_bytes, settings, monkeypatch):
+    pdf_mod = importlib.import_module("pitch90.ingest.pdf")
+    real = pdf_mod._extract_page
+
+    def flaky(page, number, allow_slow):
+        if number == 1:
+            raise RuntimeError("broken page")
+        return real(page, number, allow_slow)
+
+    monkeypatch.setattr(pdf_mod, "_extract_page", flaky)
+    deck = extract_deck("deck.pdf", pdf_bytes, settings)
+    assert len(deck.units) == 4 and "Beta page" in deck.unit(2).text
+    assert any(1 in w.units and "could not be processed" in w.message for w in deck.warnings)
+
+
+def test_extraction_budget_skips_slow_work_but_finishes(pdf_bytes, settings):
+    tight = settings.model_copy(update={"extraction_budget_seconds": 0})
+    deck = extract_deck("deck.pdf", pdf_bytes, tight)
+    assert len(deck.units) == 4
+    assert deck.unit(3).ocr_text == "" and 3 not in deck.images
+    assert any("time budget" in w.message for w in deck.warnings)

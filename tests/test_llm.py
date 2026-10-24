@@ -34,9 +34,11 @@ class ScriptedAnalyzer(AnthropicAnalyzer):
         super().__init__(settings, client=object())
         self.responses = list(responses)
         self.calls = 0
+        self.contents = []
 
-    def _request(self, content):
+    def _request(self, content, progress=None):
         self.calls += 1
+        self.contents.append(content)
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -58,7 +60,7 @@ def test_code_fenced_json_accepted(demo_json):
 @pytest.mark.parametrize("text,match", [
     ("not json", "not valid JSON"),
     ('{"company_name": "x"', "not valid JSON"),
-    ('{"company_name": "x"}', "expected structure"),
+    ('{"company_name": "x"}', "no valid element scores"),
     ("[]", "expected structure"),
 ])
 def test_malformed_responses_rejected(text, match):
@@ -66,22 +68,37 @@ def test_malformed_responses_rejected(text, match):
         parse_response(text)
 
 
-def test_out_of_range_score_rejected(demo_json):
+def test_out_of_range_score_salvaged_as_not_assessed(demo_json):
     demo_json["elements"][0]["score"] = 7
-    with pytest.raises(LLMResponseInvalid, match="invalid scores"):
-        parse_response(json.dumps(demo_json))
+    result = parse_response(json.dumps(demo_json))
+    first = result.elements[0]
+    assert first.score == 0 and "Not assessed" in first.rationale
+    assert any("customer_problem" in n for n in result.salvage_notes)
+    assert [e.score for e in result.elements[1:]] == [3, 3, 4, 3]
 
 
-def test_missing_element_rejected(demo_json):
+def test_missing_element_salvaged(demo_json):
     demo_json["elements"] = demo_json["elements"][:4]
-    with pytest.raises(LLMResponseInvalid, match="invalid scores"):
-        parse_response(json.dumps(demo_json))
+    result = parse_response(json.dumps(demo_json))
+    assert len(result.elements) == 5 and result.elements[-1].score == 0
 
 
-def test_wrong_enum_rejected(demo_json):
+def test_malformed_items_dropped_rest_kept(demo_json):
+    total = len(demo_json["facts"])
     demo_json["facts"][0]["status"] = "verified"
-    with pytest.raises(LLMResponseInvalid):
-        parse_response(json.dumps(demo_json))
+    demo_json["strongest_points"][0] = {"oops": 1}
+    del demo_json["onepager"]["terms"]
+    result = parse_response(json.dumps(demo_json))
+    assert len(result.facts) == total - 1
+    assert len(result.strongest_points) == 2
+    assert result.onepager.terms.text == "Not provided"
+    assert result.onepager.problem_why_now.text.startswith("Rural")
+    notes = " ".join(result.salvage_notes)
+    assert "facts" in notes and "strongest_points" in notes and "terms" in notes
+
+
+def test_valid_response_has_no_salvage_notes(demo_json):
+    assert parse_response(json.dumps(demo_json)).salvage_notes == []
 
 
 # --------------------------------------------------------------------------- retries and errors
@@ -131,6 +148,10 @@ class FakeStream:
 
     def __exit__(self, *a):
         return False
+
+    def __iter__(self):
+        return iter([SimpleNamespace(type="content_block_delta",
+                                     delta=SimpleNamespace(type="text_delta", text="{}"))])
 
     def get_final_message(self):
         return self.message
@@ -195,3 +216,43 @@ def test_check_connection(settings):
     bad = SimpleNamespace(models=SimpleNamespace(retrieve=deny))
     with pytest.raises(LLMError, match="key was rejected"):
         AnthropicAnalyzer(settings, client=bad).check_connection()
+
+
+def test_truncated_output_retried_with_concise_brief(settings, demo_json):
+    from pitch90.llm import CONCISE_RETRY, OutputTruncated
+
+    analyzer = ScriptedAnalyzer(settings, [OutputTruncated("cut off"), json.dumps(demo_json)])
+    result, _ = analyzer.analyze(tiny_deck())
+    assert result.company_name
+    assert analyzer.contents[1][-1]["text"] == CONCISE_RETRY
+    assert analyzer.contents[0][-1]["text"] != CONCISE_RETRY
+
+
+def test_deadline_stops_a_hanging_analysis(settings):
+    from pitch90.llm import AnalysisTimeout
+
+    msg = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text="{}")])
+    quick = settings.model_copy(update={"analysis_deadline_seconds": -1})
+    with pytest.raises(AnalysisTimeout, match="did not finish"):
+        AnthropicAnalyzer(quick, client=fake_client(msg, {})).analyze(tiny_deck())
+
+
+def test_progress_reported(settings, demo_json):
+    seen = []
+    msg = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=json.dumps(demo_json))])
+    AnthropicAnalyzer(settings, client=fake_client(msg, {})).analyze(
+        tiny_deck(), lambda phase, elapsed, chars: seen.append((phase, chars)))
+    assert seen and seen[0][0] == "Writing the analysis" and seen[0][1] == 2
+
+
+def test_image_selection_prefers_text_poor_pages():
+    from pitch90.llm import select_images
+
+    units = [UnitContent(number=n, text="t", needs_visual=True, visual_reason=r) for n, r in [
+        (1, "images cover 90% of the page"), (2, "likely chart or diagram"),
+        (3, "little extractable text"), (4, "images cover 50% of the page"),
+    ]]
+    deck = ExtractedDeck(filename="d.pdf", source_type="pdf", unit_label="page", units=units,
+                         images={n: b"x" for n in range(1, 5)})
+    assert select_images(deck, 2) == [2, 3]
+    assert select_images(deck, 10) == [1, 2, 3, 4]

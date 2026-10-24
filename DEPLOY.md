@@ -28,11 +28,13 @@ railway init           # new project (or `railway link` for an existing one)
 | Variable | Required | Value |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | yes | your Console key |
-| `APP_PASSWORD` | **strongly recommended** | sign-in password. Without it, anyone with the URL can run paid analyses on your key. The app shows a red warning when deployed without it. |
-| `APP_USERNAME` | no | defaults to `ten` |
+| `APP_PASSWORD` | no | leave **unset** to run without sign-in (the default). Set it only if you want a login screen. |
+| `APP_USERNAME` | no | only used when `APP_PASSWORD` is set; defaults to `ten` |
 | `PITCH90_MODEL` | no | `claude-opus-5-5` |
 | `PITCH90_EFFORT` | no | `high` |
 | `PITCH90_MAX_CONCURRENT` | no | `2`: maximum simultaneous paid analyses across all users |
+| `PITCH90_ANALYSIS_DEADLINE_SECONDS` | no | `600`: hard limit for one analysis; a run that exceeds it stops with a clear message instead of hanging |
+| `PITCH90_EXTRACTION_BUDGET_SECONDS` | no | `120`: time allowed for OCR and slide rendering; slides/pages beyond it are analysed from their text and flagged |
 | `PITCH90_MAX_UPLOAD_MB` | no | `50` (Streamlit's own cap is set in `.streamlit/config.toml`) |
 | `PITCH90_REPORT_TEMPLATE` | no | path inside the image to a custom report template |
 | `RESEND_API_KEY` | for email | Resend API key. When set, every analysis is emailed with a summary, the one-pager PDF, the report PDF and the JSON. |
@@ -43,8 +45,7 @@ railway init           # new project (or `railway link` for an existing one)
 You can set them in the dashboard (service → Variables) or from the CLI:
 
 ```bash
-railway variables --set "ANTHROPIC_API_KEY=sk-ant-..." --set "APP_PASSWORD=choose-a-strong-one" \
-                   --set "RESEND_API_KEY=re_..."
+railway variables --set "ANTHROPIC_API_KEY=sk-ant-..." --set "RESEND_API_KEY=re_..."
 ```
 
 ## 4. Deploy
@@ -61,11 +62,11 @@ unless `requirements.txt` or the Dockerfile changes.
 ## 5. Verify
 
 1. `curl https://<your-domain>/_stcore/health` returns `ok`.
-2. Open the URL and sign in. The sidebar should show **API key configured**, **Local OCR
+2. Open the URL (no sign-in unless you set `APP_PASSWORD`). The sidebar should show **API key configured**, **Local OCR
    available** and **LibreOffice found**.
 3. Click **Test API connection**. It checks the key and model with a free Models API lookup and
    uses no tokens.
-4. Upload a deck, tick the consent box and click **Run analysis**. Then download the one-pager,
+4. Upload a deck and click **Run analysis**. A progress panel shows elapsed time while Claude works. Then download the one-pager,
    the report (built from `templates/analysis_report.md`) and the JSON.
 5. With `RESEND_API_KEY` set, a green "Results emailed to Info@tencapital.group" banner appears
    above the findings and the email arrives with the three attachments. If Resend refuses the
@@ -77,8 +78,9 @@ unless `requirements.txt` or the Dockerfile changes.
 
 - **Cost.** Each analysis is one Messages API call: the deck text plus up to
   `PITCH90_MAX_VISUAL_PAGES` slide images in, up to about 32K tokens out. Typical decks cost
-  well under a dollar on Claude Opus 5.5 at `high` effort. Use `PITCH90_MAX_CONCURRENT` and
-  `APP_PASSWORD` to control spend.
+  well under a dollar on Claude Opus 5.5 at `high` effort. `PITCH90_MAX_CONCURRENT` limits simultaneous
+  runs. Without `APP_PASSWORD`, anyone with the URL can run analyses on your key; keep the URL
+  private or set a password if that becomes a concern.
 - **Nothing is stored server-side.** Uploads are processed in temporary directories that are
   deleted afterwards. Results live in the browser session until downloaded, and a redeploy or
   closed tab discards them.
